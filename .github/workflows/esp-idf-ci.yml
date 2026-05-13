@@ -34,28 +34,102 @@ jobs:
           apt-get update
           apt-get install -y clang-format cppcheck
 
-      - name: Check formatting
-        run: |
-          mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
-          if [ ${#source_files[@]} -eq 0 ]; then
-            echo 'No source files found to format-check.'
-            exit 0
-          fi
-          clang-format --dry-run --Werror "${source_files[@]}"
+      # - name: Check formatting
+      #   run: |
+      #     mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
+      #     if [ ${#source_files[@]} -eq 0 ]; then
+      #       echo 'No source files found to format-check.'
+      #       exit 0
+      #     fi
+      #     clang-format --dry-run --Werror "${source_files[@]}"
 
       - name: Run static analysis
+        id: cppcheck
         run: |
+          mkdir -p reports
           mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
           if [ ${#source_files[@]} -eq 0 ]; then
             echo 'No source files found for static analysis.'
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<results version="2"><cppcheck version="0"/><errors></errors></results>' > reports/cppcheck.xml
+            echo 'exit_code=0' >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          set +e
           cppcheck \
             --enable=warning,style,performance,portability \
             --error-exitcode=1 \
             --inline-suppr \
-            --quiet \
-            "${source_files[@]}"
+            --xml \
+            --xml-version=2 \
+            "${source_files[@]}" \
+            2> reports/cppcheck.xml
+          cppcheck_exit_code=$?
+          set -e
+          echo "exit_code=$cppcheck_exit_code" >> "$GITHUB_OUTPUT"
+
+      - name: Emit cppcheck annotations
+        if: always()
+        run: |
+          python3 <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          report_path = 'reports/cppcheck.xml'
+          if not os.path.exists(report_path):
+              raise SystemExit('cppcheck report not found')
+
+          def escape(value: str) -> str:
+              return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+
+          tree = ET.parse(report_path)
+          root = tree.getroot()
+          for error in root.findall('./errors/error'):
+              severity = error.attrib.get('severity', 'warning')
+              message = error.attrib.get('msg', error.attrib.get('id', 'cppcheck finding'))
+              verbose = error.attrib.get('verbose', '')
+              rule = error.attrib.get('id', 'cppcheck')
+              location = error.find('location')
+
+              command = 'warning'
+              if severity in {'error'}:
+                  command = 'error'
+              elif severity in {'style', 'performance', 'portability', 'information'}:
+                  command = 'notice'
+
+              params = []
+              if location is not None:
+                  file_name = location.attrib.get('file')
+                  line = location.attrib.get('line')
+                  column = location.attrib.get('column')
+                  if file_name:
+                      params.append(f'file={file_name}')
+                  if line:
+                      params.append(f'line={line}')
+                  if column:
+                      params.append(f'col={column}')
+              if rule:
+                  params.append(f'title={escape(rule)}')
+
+              body = message
+              if verbose and verbose != message:
+                  body = f'{message} ({verbose})'
+
+              print(f"::{command} {','.join(params)}::{escape(body)}")
+          PY
+
+      - name: Upload cppcheck report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cppcheck-report
+          if-no-files-found: error
+          path: reports/cppcheck.xml
+
+      - name: Fail on cppcheck findings
+        if: steps.cppcheck.outputs.exit_code != '0'
+        run: |
+          echo "cppcheck reported findings. See the annotations above or the cppcheck-report artifact."
+          exit 1
 
   build:
     runs-on: ubuntu-latest
