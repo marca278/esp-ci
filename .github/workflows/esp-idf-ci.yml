@@ -13,6 +13,47 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:latest
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install quality tools
+        run: |
+          apt-get update
+          apt-get install -y clang-format cppcheck
+
+      - name: Check formatting
+        run: |
+          mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
+          if [ ${#source_files[@]} -eq 0 ]; then
+            echo 'No source files found to format-check.'
+            exit 0
+          fi
+          clang-format --dry-run --Werror "${source_files[@]}"
+
+      - name: Run static analysis
+        run: |
+          mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
+          if [ ${#source_files[@]} -eq 0 ]; then
+            echo 'No source files found for static analysis.'
+            exit 0
+          fi
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --error-exitcode=1 \
+            --inline-suppr \
+            --quiet \
+            "${source_files[@]}"
+
   build:
     runs-on: ubuntu-latest
     container:
