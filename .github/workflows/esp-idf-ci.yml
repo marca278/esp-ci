@@ -1,0 +1,47 @@
+name: ESP-IDF CI
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: esp-idf-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: espressif/idf:v6.1
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Build firmware
+        run: |
+          . /opt/esp/idf/export.sh
+          idf.py -B build-ci set-target esp32
+          idf.py -B build-ci build
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: esp-test-build
+          if-no-files-found: error
+          path: |
+            build-ci/*.bin
+            build-ci/*.elf
+            build-ci/*.map
+            build-ci/bootloader/*.bin
+            build-ci/partition_table/*.bin
