@@ -70,13 +70,13 @@ jobs:
         id: codechecker
         run: |
           mkdir -p reports
-          cat <<EOF > reports/codechecker.skip
-          -*
-          +$GITHUB_WORKSPACE/*
-          -$GITHUB_WORKSPACE/build/*
-          -$GITHUB_WORKSPACE/build-checks/*
-          -$GITHUB_WORKSPACE/main/advanced/build/*
-          EOF
+          printf '%s\n' \
+            "-$GITHUB_WORKSPACE/build/*" \
+            "-$GITHUB_WORKSPACE/build-checks/*" \
+            "-$GITHUB_WORKSPACE/main/advanced/build/*" \
+            "+$GITHUB_WORKSPACE/main/*" \
+            '-*' \
+            > reports/codechecker.skip
           mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
           if [ ${#source_files[@]} -eq 0 ]; then
             echo 'No source files found for static analysis.'
