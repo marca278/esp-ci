@@ -2,6 +2,12 @@ name: ESP-IDF CI
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CPPCHECK_MAX_ERROR: '0'
+  CPPCHECK_MAX_WARNING: '0'
+  CPPCHECK_MAX_PORTABILITY: '0'
+  CPPCHECK_MAX_PERFORMANCE: '0'
+  CPPCHECK_MAX_STYLE: '20'
+  CPPCHECK_MAX_INFORMATION: '20'
 
 on:
   push:
@@ -60,7 +66,6 @@ jobs:
           set +e
           cppcheck \
             --enable=warning,style,performance,portability \
-            --error-exitcode=1 \
             --inline-suppr \
             --xml \
             --xml-version=2 \
@@ -120,6 +125,79 @@ jobs:
               print(f"::{command} {','.join(params)}::{escape(body)}")
           PY
 
+      - name: Evaluate cppcheck quality gates
+        if: always()
+        id: cppcheck_gates
+        env:
+          CPPCHECK_MAX_ERROR: ${{ env.CPPCHECK_MAX_ERROR }}
+          CPPCHECK_MAX_WARNING: ${{ env.CPPCHECK_MAX_WARNING }}
+          CPPCHECK_MAX_PORTABILITY: ${{ env.CPPCHECK_MAX_PORTABILITY }}
+          CPPCHECK_MAX_PERFORMANCE: ${{ env.CPPCHECK_MAX_PERFORMANCE }}
+          CPPCHECK_MAX_STYLE: ${{ env.CPPCHECK_MAX_STYLE }}
+          CPPCHECK_MAX_INFORMATION: ${{ env.CPPCHECK_MAX_INFORMATION }}
+        run: |
+          python3 <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+
+          report_path = 'reports/cppcheck.xml'
+          tree = ET.parse(report_path)
+          root = tree.getroot()
+
+          counters = {
+              'error': 0,
+              'warning': 0,
+              'portability': 0,
+              'performance': 0,
+              'style': 0,
+              'information': 0,
+          }
+          for error in root.findall('./errors/error'):
+              severity = error.attrib.get('severity', 'warning')
+              counters[severity] = counters.get(severity, 0) + 1
+
+          thresholds = {
+              'error': int(os.environ['CPPCHECK_MAX_ERROR']),
+              'warning': int(os.environ['CPPCHECK_MAX_WARNING']),
+              'portability': int(os.environ['CPPCHECK_MAX_PORTABILITY']),
+              'performance': int(os.environ['CPPCHECK_MAX_PERFORMANCE']),
+              'style': int(os.environ['CPPCHECK_MAX_STYLE']),
+              'information': int(os.environ['CPPCHECK_MAX_INFORMATION']),
+          }
+
+          failures = []
+          for severity, count in counters.items():
+              threshold = thresholds[severity]
+              if count > threshold:
+                  failures.append(f'{severity}: {count} > {threshold}')
+
+          summary_lines = [
+              '## Cppcheck Quality Gates',
+              '',
+              '| Severity | Findings | Threshold |',
+              '| --- | ---: | ---: |',
+          ]
+          for severity in ['error', 'warning', 'portability', 'performance', 'style', 'information']:
+              summary_lines.append(f'| {severity} | {counters.get(severity, 0)} | {thresholds[severity]} |')
+
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('\n'.join(summary_lines) + '\n')
+              if failures:
+                  summary.write('\nGate failures:\n')
+                  for failure in failures:
+                      summary.write(f'- {failure}\n')
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as output:
+              output.write(f'failed={str(bool(failures)).lower()}\n')
+              output.write(f'failure_count={len(failures)}\n')
+
+          if failures:
+              for failure in failures:
+                  print(f'::error title=cppcheck quality gate::{failure}')
+          else:
+              print('Cppcheck quality gates passed.')
+          PY
+
       - name: Upload cppcheck report
         if: always()
         uses: actions/upload-artifact@v7
@@ -128,10 +206,16 @@ jobs:
           if-no-files-found: error
           path: reports/cppcheck.xml
 
-      - name: Fail on cppcheck findings
+      - name: Fail on cppcheck execution
         if: steps.cppcheck.outputs.exit_code != '0'
         run: |
-          echo "cppcheck reported findings. See the annotations above or the cppcheck-report artifact."
+          echo "cppcheck execution failed. See the checks job log for details."
+          exit 1
+
+      - name: Fail on cppcheck quality gates
+        if: steps.cppcheck_gates.outputs.failed == 'true'
+        run: |
+          echo "cppcheck quality gates failed. See the workflow summary, annotations, or cppcheck-report artifact."
           exit 1
 
   build:
