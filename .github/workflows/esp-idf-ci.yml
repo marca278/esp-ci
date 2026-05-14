@@ -2,12 +2,12 @@ name: ESP-IDF CI
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-  CODECHECKER_MAX_CRITICAL: '0'
-  CODECHECKER_MAX_HIGH: '0'
-  CODECHECKER_MAX_MEDIUM: '0'
-  CODECHECKER_MAX_LOW: '10'
-  CODECHECKER_MAX_STYLE: '20'
-  CODECHECKER_MAX_UNSPECIFIED: '0'
+  CPPCHECK_MAX_ERROR: '0'
+  CPPCHECK_MAX_WARNING: '0'
+  CPPCHECK_MAX_PORTABILITY: '0'
+  CPPCHECK_MAX_PERFORMANCE: '0'
+  CPPCHECK_MAX_STYLE: '20'
+  CPPCHECK_MAX_INFORMATION: '20'
 
 on:
   push:
@@ -41,21 +41,7 @@ jobs:
       - name: Install quality tools
         run: |
           apt-get update
-          apt-get install -y cppcheck python3-venv
-
-      - name: Set up CodeChecker
-        run: |
-          python3 -m venv .venv-codechecker
-          . .venv-codechecker/bin/activate
-          pip install --upgrade pip
-          pip install codechecker
-
-      - name: Generate compilation database
-        run: |
-          . /opt/esp/idf/export.sh
-          idf.py -B build-checks set-target esp32
-          idf.py -B build-checks reconfigure
-          test -f build-checks/compile_commands.json
+          apt-get install -y cppcheck python3-pygments
 
       # - name: Check formatting
       #   run: |
@@ -67,129 +53,116 @@ jobs:
       #     clang-format --dry-run --Werror "${source_files[@]}"
 
       - name: Run static analysis
-        id: codechecker
+        id: cppcheck
         run: |
           mkdir -p reports
-          printf '%s\n' \
-            "-$GITHUB_WORKSPACE/build/*" \
-            "-$GITHUB_WORKSPACE/build-checks/*" \
-            "-$GITHUB_WORKSPACE/main/advanced/build/*" \
-            "+$GITHUB_WORKSPACE/main/*" \
-            '-*' \
-            > reports/codechecker.skip
           mapfile -d '' source_files < <(git ls-files -z '*.c' '*.h' '*.cpp' '*.hpp' ':(exclude)build/**' ':(exclude)main/advanced/build/**')
           if [ ${#source_files[@]} -eq 0 ]; then
             echo 'No source files found for static analysis.'
-            printf '%s\n' '{"version": 1, "reports": []}' > reports/codechecker.json
+            printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<results version="2"><cppcheck version="0"/><errors></errors></results>' > reports/cppcheck.xml
             echo 'exit_code=0' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          . .venv-codechecker/bin/activate
-          export CC_ANALYZERS_FROM_PATH=1
-          rm -rf reports/codechecker
           set +e
-          CodeChecker analyze build-checks/compile_commands.json \
-            --output reports/codechecker \
-            --analyzers cppcheck \
-            --ignore reports/codechecker.skip
-          codechecker_exit_code=$?
+          cppcheck \
+            --enable=warning,style,performance,portability \
+            --inline-suppr \
+            --xml \
+            --xml-version=2 \
+            "${source_files[@]}" \
+            2> reports/cppcheck.xml
+          cppcheck_exit_code=$?
           set -e
-          if [ -d reports/codechecker ]; then
-            CodeChecker parse -e json reports/codechecker > reports/codechecker.json
-          else
-            printf '%s\n' '{"version": 1, "reports": []}' > reports/codechecker.json
-          fi
-          echo "exit_code=$codechecker_exit_code" >> "$GITHUB_OUTPUT"
+          echo "exit_code=$cppcheck_exit_code" >> "$GITHUB_OUTPUT"
 
-      - name: Emit CodeChecker annotations
+      - name: Emit cppcheck annotations
         if: always()
         run: |
           python3 <<'PY'
-          import json
           import os
+          import xml.etree.ElementTree as ET
 
-          report_path = 'reports/codechecker.json'
+          report_path = 'reports/cppcheck.xml'
           if not os.path.exists(report_path):
-              raise SystemExit('CodeChecker report not found')
+              raise SystemExit('cppcheck report not found')
 
           def escape(value: str) -> str:
               return value.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
 
-          with open(report_path, encoding='utf-8') as report_file:
-              report = json.load(report_file)
+          tree = ET.parse(report_path)
+          root = tree.getroot()
+          for error in root.findall('./errors/error'):
+              severity = error.attrib.get('severity', 'warning')
+              message = error.attrib.get('msg', error.attrib.get('id', 'cppcheck finding'))
+              verbose = error.attrib.get('verbose', '')
+              rule = error.attrib.get('id', 'cppcheck')
+              location = error.find('location')
 
-          workspace = os.environ.get('GITHUB_WORKSPACE', '')
-          for item in report.get('reports', []):
-              severity = (item.get('severity') or 'UNSPECIFIED').upper()
-              message = item.get('message') or item.get('checker_name') or 'CodeChecker finding'
-              rule = item.get('checker_name') or 'CodeChecker'
-              file_info = item.get('file') or {}
-              file_name = file_info.get('path') or file_info.get('original_path') or ''
-              line = item.get('line')
-              column = item.get('column')
-
-              if not file_name and file_info.get('original_path'):
-                  file_name = file_info['original_path']
-              if workspace and file_name.startswith(workspace + '/'):
-                  file_name = os.path.relpath(file_name, workspace)
-
-              command = 'notice'
-              if severity in {'CRITICAL', 'HIGH'}:
+              command = 'warning'
+              if severity in {'error'}:
                   command = 'error'
-              elif severity in {'MEDIUM', 'LOW'}:
-                  command = 'warning'
+              elif severity in {'style', 'performance', 'portability', 'information'}:
+                  command = 'notice'
 
               params = []
-              if file_name:
-                  params.append(f'file={file_name}')
-              if line:
-                  params.append(f'line={line}')
-              if column:
-                  params.append(f'col={column}')
+              if location is not None:
+                  file_name = location.attrib.get('file')
+                  line = location.attrib.get('line')
+                  column = location.attrib.get('column')
+                  if file_name:
+                      params.append(f'file={file_name}')
+                  if line:
+                      params.append(f'line={line}')
+                  if column:
+                      params.append(f'col={column}')
               if rule:
                   params.append(f'title={escape(rule)}')
 
-              print(f"::{command} {','.join(params)}::{escape(message)}")
+              body = message
+              if verbose and verbose != message:
+                  body = f'{message} ({verbose})'
+
+              print(f"::{command} {','.join(params)}::{escape(body)}")
           PY
 
-      - name: Evaluate CodeChecker quality gates
+      - name: Evaluate cppcheck quality gates
         if: always()
-        id: codechecker_gates
+        id: cppcheck_gates
         env:
-          CODECHECKER_MAX_CRITICAL: ${{ env.CODECHECKER_MAX_CRITICAL }}
-          CODECHECKER_MAX_HIGH: ${{ env.CODECHECKER_MAX_HIGH }}
-          CODECHECKER_MAX_MEDIUM: ${{ env.CODECHECKER_MAX_MEDIUM }}
-          CODECHECKER_MAX_LOW: ${{ env.CODECHECKER_MAX_LOW }}
-          CODECHECKER_MAX_STYLE: ${{ env.CODECHECKER_MAX_STYLE }}
-          CODECHECKER_MAX_UNSPECIFIED: ${{ env.CODECHECKER_MAX_UNSPECIFIED }}
+          CPPCHECK_MAX_ERROR: ${{ env.CPPCHECK_MAX_ERROR }}
+          CPPCHECK_MAX_WARNING: ${{ env.CPPCHECK_MAX_WARNING }}
+          CPPCHECK_MAX_PORTABILITY: ${{ env.CPPCHECK_MAX_PORTABILITY }}
+          CPPCHECK_MAX_PERFORMANCE: ${{ env.CPPCHECK_MAX_PERFORMANCE }}
+          CPPCHECK_MAX_STYLE: ${{ env.CPPCHECK_MAX_STYLE }}
+          CPPCHECK_MAX_INFORMATION: ${{ env.CPPCHECK_MAX_INFORMATION }}
         run: |
           python3 <<'PY'
-          import json
           import os
+          import xml.etree.ElementTree as ET
 
-          report_path = 'reports/codechecker.json'
-          with open(report_path, encoding='utf-8') as report_file:
-              report = json.load(report_file)
+          report_path = 'reports/cppcheck.xml'
+          tree = ET.parse(report_path)
+          root = tree.getroot()
 
           counters = {
-              'CRITICAL': 0,
-              'HIGH': 0,
-              'MEDIUM': 0,
-              'LOW': 0,
-              'STYLE': 0,
-              'UNSPECIFIED': 0,
+              'error': 0,
+              'warning': 0,
+              'portability': 0,
+              'performance': 0,
+              'style': 0,
+              'information': 0,
           }
-          for item in report.get('reports', []):
-              severity = (item.get('severity') or 'UNSPECIFIED').upper()
+          for error in root.findall('./errors/error'):
+              severity = error.attrib.get('severity', 'warning')
               counters[severity] = counters.get(severity, 0) + 1
 
           thresholds = {
-              'CRITICAL': int(os.environ['CODECHECKER_MAX_CRITICAL']),
-              'HIGH': int(os.environ['CODECHECKER_MAX_HIGH']),
-              'MEDIUM': int(os.environ['CODECHECKER_MAX_MEDIUM']),
-              'LOW': int(os.environ['CODECHECKER_MAX_LOW']),
-              'STYLE': int(os.environ['CODECHECKER_MAX_STYLE']),
-              'UNSPECIFIED': int(os.environ['CODECHECKER_MAX_UNSPECIFIED']),
+            'error': int(os.environ['CPPCHECK_MAX_ERROR']),
+            'warning': int(os.environ['CPPCHECK_MAX_WARNING']),
+            'portability': int(os.environ['CPPCHECK_MAX_PORTABILITY']),
+            'performance': int(os.environ['CPPCHECK_MAX_PERFORMANCE']),
+            'style': int(os.environ['CPPCHECK_MAX_STYLE']),
+            'information': int(os.environ['CPPCHECK_MAX_INFORMATION']),
           }
 
           failures = []
@@ -199,12 +172,12 @@ jobs:
                   failures.append(f'{severity}: {count} > {threshold}')
 
           summary_lines = [
-              '## CodeChecker Quality Gates',
+              '## Cppcheck Quality Gates',
               '',
               '| Severity | Findings | Threshold |',
               '| --- | ---: | ---: |',
           ]
-          for severity in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'STYLE', 'UNSPECIFIED']:
+          for severity in ['error', 'warning', 'portability', 'performance', 'style', 'information']:
               summary_lines.append(f'| {severity} | {counters.get(severity, 0)} | {thresholds[severity]} |')
 
           with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
@@ -220,32 +193,40 @@ jobs:
 
           if failures:
               for failure in failures:
-                  print(f'::error title=CodeChecker quality gate::{failure}')
+                  print(f'::error title=cppcheck quality gate::{failure}')
           else:
-              print('CodeChecker quality gates passed.')
+              print('Cppcheck quality gates passed.')
           PY
 
-      - name: Upload CodeChecker report
+      - name: Generate cppcheck HTML report
+        if: always()
+        run: |
+          rm -rf reports/cppcheck-html
+          cppcheck-htmlreport \
+            --file=reports/cppcheck.xml \
+            --report-dir=reports/cppcheck-html \
+            --source-dir="$GITHUB_WORKSPACE"
+
+      - name: Upload cppcheck report
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: codechecker-report
+          name: cppcheck-report
           if-no-files-found: error
           path: |
-            reports/codechecker/
-            reports/codechecker.json
-            reports/codechecker.skip
+            reports/cppcheck.xml
+            reports/cppcheck-html/
 
-      - name: Fail on CodeChecker execution
-        if: steps.codechecker.outputs.exit_code != '0'
+      - name: Fail on cppcheck execution
+        if: steps.cppcheck.outputs.exit_code != '0'
         run: |
-          echo "CodeChecker execution failed. See the checks job log for details."
+          echo "cppcheck execution failed. See the checks job log for details."
           exit 1
 
-      - name: Fail on CodeChecker quality gates
-        if: steps.codechecker_gates.outputs.failed == 'true'
+      - name: Fail on cppcheck quality gates
+        if: steps.cppcheck_gates.outputs.failed == 'true'
         run: |
-          echo "CodeChecker quality gates failed. See the workflow summary, annotations, or codechecker-report artifact."
+          echo "cppcheck quality gates failed. See the workflow summary, annotations, or cppcheck-report artifact."
           exit 1
 
   build:
