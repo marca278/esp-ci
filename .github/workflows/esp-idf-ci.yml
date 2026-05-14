@@ -41,7 +41,7 @@ jobs:
       - name: Install quality tools
         run: |
           apt-get update
-          apt-get install -y clang clang-tidy python3-venv
+          apt-get install -y cppcheck python3-venv
 
       - name: Set up CodeChecker
         run: |
@@ -90,7 +90,7 @@ jobs:
           set +e
           CodeChecker analyze build-checks/compile_commands.json \
             --output reports/codechecker \
-            --analyzers clangsa clang-tidy \
+            --analyzers cppcheck \
             --ignore reports/codechecker.skip
           codechecker_exit_code=$?
           set -e
